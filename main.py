@@ -13,29 +13,39 @@ from collections import deque
 pyautogui.FAILSAFE = True  # Move mouse to top-left corner to abort
 pyautogui.PAUSE = 0  # No pause between pyautogui calls for maximum speed
 
+def get_screen_size():
+    user32 = ctypes.windll.user32
+    screensize = (user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
+    return screensize
+
 class SmoothCursorController:
-    def __init__(self, smoothing_factor=0.15, debounce_time=0.016, max_speed=2000):
+    def __init__(self, smoothing_factor=0.15, debounce_time=0.016, movement_threshold=10):
         """
         Initialize smooth cursor controller
         
         Args:
             smoothing_factor: How much to smooth movement (0.1 = very smooth, 0.5 = less smooth)
             debounce_time: Minimum time between movements in seconds (0.016 = ~60fps)
-            max_speed: Maximum pixels per second the cursor can move
+            movement_threshold: Minimum pixel distance to consider as movement
         """
         self.smoothing_factor = smoothing_factor
         self.debounce_time = debounce_time
-        self.max_speed = max_speed
+        self.movement_threshold = movement_threshold
         
         self.current_pos = None
         self.target_pos = None
         self.last_move_time = 0
         self.position_history = deque(maxlen=5)  # Keep last 5 positions for smoothing
+        self.last_hand_pos = None
+        self.hand_movement_detected = False
         
         # Threading for smooth movement
         self.movement_thread = None
         self.should_stop = False
         self.movement_lock = threading.Lock()
+        
+        # Screen boundaries
+        self.screen_width, self.screen_height = get_screen_size()
         
         # Start movement thread
         self.start_movement_thread()
@@ -59,66 +69,86 @@ class SmoothCursorController:
             
             with self.movement_lock:
                 if (self.target_pos is not None and 
+                    self.hand_movement_detected and
                     current_time - self.last_move_time >= self.debounce_time):
                     
-                    if self.current_pos is None:
-                        # First movement - get current cursor position
-                        try:
-                            self.current_pos = pyautogui.position()
-                        except:
-                            self.current_pos = (0, 0)
-                    
-                    # Calculate smooth movement
+                    # Use absolute positioning - directly move to target
                     target_x, target_y = self.target_pos
-                    current_x, current_y = self.current_pos
                     
-                    # Calculate distance and apply speed limiting
-                    dx = target_x - current_x
-                    dy = target_y - current_y
-                    distance = np.sqrt(dx*dx + dy*dy)
+                    # Ensure target is within screen boundaries
+                    target_x = max(0, min(self.screen_width - 1, target_x))
+                    target_y = max(0, min(self.screen_height - 1, target_y))
                     
-                    if distance > 0:
-                        # Apply smoothing
-                        new_x = current_x + dx * self.smoothing_factor
-                        new_y = current_y + dy * self.smoothing_factor
-                        
-                        # Speed limiting
-                        time_delta = current_time - self.last_move_time
-                        if time_delta > 0:
-                            max_distance = self.max_speed * time_delta
-                            if distance > max_distance:
-                                # Scale down movement to respect max speed
-                                scale = max_distance / distance
-                                new_x = current_x + dx * scale
-                                new_y = current_y + dy * scale
-                        
-                        # Apply movement
-                        try:
-                            pyautogui.moveTo(int(new_x), int(new_y))
-                            self.current_pos = (new_x, new_y)
-                            self.last_move_time = current_time
-                        except Exception as e:
-                            print(f"Mouse movement error: {e}")
+                    # Apply smoothing if we have a previous position
+                    if self.current_pos is not None:
+                        current_x, current_y = self.current_pos
+                        new_x = current_x + (target_x - current_x) * self.smoothing_factor
+                        new_y = current_y + (target_y - current_y) * self.smoothing_factor
+                    else:
+                        new_x, new_y = target_x, target_y
+                    
+                    # Ensure final position is within screen boundaries
+                    new_x = max(0, min(self.screen_width - 1, new_x))
+                    new_y = max(0, min(self.screen_height - 1, new_y))
+                    
+                    # Apply movement
+                    try:
+                        pyautogui.moveTo(int(new_x), int(new_y))
+                        self.current_pos = (new_x, new_y)
+                        self.last_move_time = current_time
+                    except Exception as e:
+                        print(f"Mouse movement error: {e}")
             
             # Sleep for smooth 60fps movement
             time.sleep(0.016)  # ~60fps
     
     def update_target(self, x, y):
-        """Update target position for smooth movement"""
+        """Update target position for smooth movement - only if hand is moving"""
         if x is None or y is None:
+            with self.movement_lock:
+                self.hand_movement_detected = False
+                self.last_hand_pos = None
             return
-            
+        
+        current_hand_pos = (float(x), float(y))
+        
         with self.movement_lock:
-            self.target_pos = (float(x), float(y))
+            # Check if hand has moved significantly
+            if self.last_hand_pos is not None:
+                distance = np.sqrt((current_hand_pos[0] - self.last_hand_pos[0])**2 + 
+                                 (current_hand_pos[1] - self.last_hand_pos[1])**2)
+                self.hand_movement_detected = distance > self.movement_threshold
+            else:
+                self.hand_movement_detected = True  # First detection
             
-            # Add to position history for additional smoothing
-            self.position_history.append((x, y))
+            if self.hand_movement_detected:
+                # Ensure coordinates are within screen boundaries
+                bounded_x = max(0, min(self.screen_width - 1, current_hand_pos[0]))
+                bounded_y = max(0, min(self.screen_height - 1, current_hand_pos[1]))
+                
+                self.target_pos = (bounded_x, bounded_y)
+                
+                # Add to position history for additional smoothing
+                self.position_history.append((bounded_x, bounded_y))
+                
+                # Use average of recent positions for even smoother movement
+                if len(self.position_history) >= 3:
+                    avg_x = sum(pos[0] for pos in self.position_history) / len(self.position_history)
+                    avg_y = sum(pos[1] for pos in self.position_history) / len(self.position_history)
+                    # Ensure averaged position is also within bounds
+                    avg_x = max(0, min(self.screen_width - 1, avg_x))
+                    avg_y = max(0, min(self.screen_height - 1, avg_y))
+                    self.target_pos = (avg_x, avg_y)
             
-            # Use average of recent positions for even smoother movement
-            if len(self.position_history) >= 3:
-                avg_x = sum(pos[0] for pos in self.position_history) / len(self.position_history)
-                avg_y = sum(pos[1] for pos in self.position_history) / len(self.position_history)
-                self.target_pos = (avg_x, avg_y)
+            self.last_hand_pos = current_hand_pos
+
+    def reset_cursor_state(self):
+        """Reset cursor state when hand disappears"""
+        with self.movement_lock:
+            self.hand_movement_detected = False
+            self.last_hand_pos = None
+            self.target_pos = None
+            self.position_history.clear()
 
 class HandDetector:
     def __init__(self):
@@ -207,11 +237,6 @@ def create_overlay(frame, hand_positions, screen_size):
     
     return frame
 
-def get_screen_size():
-    user32 = ctypes.windll.user32
-    screensize = (user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
-    return screensize
-
 def convert_to_screen_coords(hand_pos, cam_size, screen_size):
     if hand_pos is None:
         return None
@@ -253,7 +278,7 @@ def main():
     cursor_controller = SmoothCursorController(
         smoothing_factor=0.15,  # Adjust for more/less smoothing
         debounce_time=0.016,    # 60fps debounce
-        max_speed=2000          # Max pixels per second
+        movement_threshold=10   # Minimum pixels to consider as movement
     )
 
     # Optimize camera settings for 60fps
@@ -288,6 +313,8 @@ def main():
     print("- Press 'space' to disable/enable mouse movement")
     print("- Press '+' to increase smoothing")
     print("- Press '-' to decrease smoothing")
+    print("- Press 'up arrow' to increase movement threshold")
+    print("- Press 'down arrow' to decrease movement threshold")
 
     # Create window
     cv2.namedWindow('Hand Detection', cv2.WINDOW_NORMAL)
@@ -357,17 +384,23 @@ def main():
                 prev_positions = hand_positions_screen.copy()
 
             # Update smooth cursor controller with hand position
-            if mouse_enabled and hand_positions_screen[active_hand] is not None:
-                pos = hand_positions_screen[active_hand]
-                if pos is not None:  # Additional type check
-                    cursor_controller.update_target(pos['x'], pos['y'])
+            if mouse_enabled:
+                if hand_positions_screen[active_hand] is not None:
+                    pos = hand_positions_screen[active_hand]
+                    if pos is not None:  # Additional type check
+                        cursor_controller.update_target(pos['x'], pos['y'])
+                else:
+                    # Hand disappeared, reset cursor state
+                    cursor_controller.reset_cursor_state()
 
             # Add overlay with position information
             frame = create_overlay(frame, hand_positions, (w, h))
             
             # Add status information
             smoothing = cursor_controller.smoothing_factor
-            status_text = f"Active hand: {active_hand.upper()} | Mouse: {'ON' if mouse_enabled else 'OFF'} | Smoothing: {smoothing:.2f}"
+            threshold = cursor_controller.movement_threshold
+            movement_status = "MOVING" if cursor_controller.hand_movement_detected else "STOPPED"
+            status_text = f"Hand: {active_hand.upper()} | Mouse: {'ON' if mouse_enabled else 'OFF'} | {movement_status} | Smooth: {smoothing:.2f} | Threshold: {threshold}"
             cv2.putText(frame, status_text, (10, h - 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
@@ -428,6 +461,15 @@ def main():
                 # Decrease smoothing (more smooth, less responsive)
                 cursor_controller.smoothing_factor = max(0.05, cursor_controller.smoothing_factor - 0.05)
                 print(f"Smoothing decreased to {cursor_controller.smoothing_factor:.2f}")
+            elif key == 0:  # Special key pressed
+                # Handle arrow keys (they return 0 first, then the special code)
+                special_key = cv2.waitKey(1) & 0xFF
+                if special_key == 82:  # Up arrow
+                    cursor_controller.movement_threshold = min(50, cursor_controller.movement_threshold + 2)
+                    print(f"Movement threshold increased to {cursor_controller.movement_threshold}")
+                elif special_key == 84:  # Down arrow
+                    cursor_controller.movement_threshold = max(2, cursor_controller.movement_threshold - 2)
+                    print(f"Movement threshold decreased to {cursor_controller.movement_threshold}")
 
     except KeyboardInterrupt:
         print("Interrupted by user")
